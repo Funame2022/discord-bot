@@ -116,7 +116,7 @@ async def check_channels():
                         pass
 
                 embed = discord.Embed(
-                    title=f"👉**{channel.name}**👈 quá 3 phút chưa xong Mission. Sửa đi mấy con bò 🐄",
+                    title=f"👉 **{channel.name}** 👈 quá 3 phút chưa xong Mission. Sửa đi mấy con bò 🐄",
                     color=0xE74C3C,
                     timestamp=now
                 )
@@ -141,6 +141,7 @@ if __name__ == "__main__":
         print("ERROR: BOT TOKEN chưa cấu hình.")
     else:
         bot.run(TOKEN)
+
 
 
 
