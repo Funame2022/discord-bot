@@ -5,37 +5,45 @@ import discord
 from discord.ext import tasks, commands
 
 # ------------------ CONFIGURATION ------------------
-import os
 TOKEN = os.getenv("BOT_TOKEN")   # ⚠ NÊN dùng ENV
 LOG_CHANNEL_ID = 1472491858096820277
 
 CHECK_CHANNEL_IDS = [
-1457983470491013321,
-1457983538250125515,
-1457983557409439795,
-1457983571670335632,
-1457983571670335632,
-1457983598601703651,
-1469244728087416897,
-1469244760094015509,
-1469244794181255200,
-1469244861818605647,
-1469245253818122281,
-1469245345593819177,
-1469245372521250972,
-1469245416301269002,
-1469246185079443548,
-1469246225760129117,
-1469246225760129117,
-1469246676219854964,
-1469246712999837808,
-1469246740166217965
+    1457983470491013321,
+    1457983538250125515,
+    1457983557409439795,
+    1457983571670335632,
+    1457983571670335632,
+    1457983598601703651,
+    1469244728087416897,
+    1469244760094015509,
+    1469244794181255200,
+    1469244861818605647,
+    1469245253818122281,
+    1469245345593819177,
+    1469245372521250972,
+    1469245416301269002,
+    1469246185079443548,
+    1469246225760129117,
+    1469246225760129117,
+    1469246676219854964,
+    1469246712999837808,
+    1469246740166217965
 ]
 
 THRESHOLD_SECONDS = 180
 CHECK_INTERVAL_SECONDS = 10
 LOCAL_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 # ---------------------------------------------------
+
+# ------------------ NEW: MENTION CONFIG ------------------
+# Nếu bạn muốn bot "ping mọi người" (mention @everyone) khi cảnh báo:
+PING_EVERYONE = True   # True = bot sẽ thêm "@everyone" khi gửi cảnh báo
+# Nếu bạn muốn bot ping 1 hoặc nhiều role cụ thể, điền list role IDs ở đây:
+PING_ROLE_IDS = [
+    # ví dụ: 123456789012345678, 987654321098765432
+]
+# --------------------------------------------------------
 
 intents = discord.Intents.default()
 intents.messages = True
@@ -113,7 +121,7 @@ async def check_channels():
                 print(f"Reset alert {channel.name}")
                 continue
 
-            # ❗ Kiểm tra quá 3 phút
+            # ❗ Kiểm tra quá threshold
             diff = (now - last_msg_time).total_seconds()
 
             if diff > THRESHOLD_SECONDS:
@@ -130,7 +138,7 @@ async def check_channels():
                         pass
 
                 embed = discord.Embed(
-                    title=f"👉**{channel.name}**👈 quá 3 phút chưa xong Mission. Fix đi mấy con bò 🐄",
+                    title=f"👉**{channel.name}**👈 quá {THRESHOLD_SECONDS//60} phút chưa xong Mission. Fix đi mấy con bò 🐄",
                     color=0xE74C3C,
                     timestamp=now
                 )
@@ -139,7 +147,22 @@ async def check_channels():
                 embed.add_field(name="Delay", value=format_seconds(diff), inline=True)
                 embed.add_field(name="Thông báo lần", value=str(state["alert_count"]), inline=True)
 
-                sent_msg = await log_ch.send(embed=embed)
+                # ---- NEW: build mention content + allowed_mentions ----
+                mention_parts = []
+                if PING_EVERYONE:
+                    mention_parts.append("@everyone")
+                if PING_ROLE_IDS:
+                    # role mention syntax: <@&ROLE_ID>
+                    mention_parts.extend(f"<@&{rid}>" for rid in PING_ROLE_IDS)
+
+                content_to_send = " ".join(mention_parts) if mention_parts else None
+                # configure allowed mentions so mentions actually ping
+                allowed = discord.AllowedMentions(everyone=bool(PING_EVERYONE),
+                                                  roles=bool(PING_ROLE_IDS),
+                                                  users=False)
+
+                sent_msg = await log_ch.send(content=content_to_send, embed=embed, allowed_mentions=allowed)
+                # ---------------------------------------------------------
 
                 # Lưu ID alert mới
                 state["alert_message_id"] = sent_msg.id
@@ -155,5 +178,3 @@ if __name__ == "__main__":
         print("ERROR: BOT TOKEN chưa cấu hình.")
     else:
         bot.run(TOKEN)
-
-
