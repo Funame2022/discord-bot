@@ -19,7 +19,7 @@ CHECK_CHANNEL_IDS = [
 ]
 
 THRESHOLD_SECONDS = 180
-CHECK_INTERVAL_SECONDS = 180
+CHECK_INTERVAL_SECONDS = 60
 LOCAL_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 # ---------------------------------------------------
 
@@ -142,3 +142,4 @@ if __name__ == "__main__":
         print("ERROR: BOT TOKEN chưa cấu hình.")
     else:
         bot.run(TOKEN)
+
