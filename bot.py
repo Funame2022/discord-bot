@@ -7,7 +7,7 @@ from discord.ext import tasks, commands
 # ------------------ CONFIGURATION ------------------
 import os
 TOKEN = os.getenv("BOT_TOKEN")   # ⚠ NÊN dùng ENV
-LOG_CHANNEL_ID = 1213543309172154444
+LOG_CHANNEL_ID = 1472491858096820277
 
 CHECK_CHANNEL_IDS = [
 1457983470491013321,
@@ -155,3 +155,4 @@ if __name__ == "__main__":
         print("ERROR: BOT TOKEN chưa cấu hình.")
     else:
         bot.run(TOKEN)
+
