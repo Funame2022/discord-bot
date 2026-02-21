@@ -19,8 +19,8 @@ MONITORED_IMAGE_PATH = "/mnt/data/93b3f5bc-2247-4f67-a02f-7eb4209abc2c.png"  # o
 # fallback if guild has no log configured
 DEFAULT_LOG_CHANNEL_ID = 1213543309172154444
 
-THRESHOLD_SECONDS = 180
-CHECK_INTERVAL_SECONDS = 60
+THRESHOLD_SECONDS = 300
+CHECK_INTERVAL_SECONDS = 180
 AUTO_DELETE_SECONDS = 300  # 5 minutes (alerts auto-delete)
 UI_TEMP_DELETE_SECONDS = 10  # how long the temporary result message remains after OK/Cancel before auto-delete
 LOCAL_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
@@ -1437,3 +1437,4 @@ if __name__ == "__main__":
         print("ERROR: BOT TOKEN chưa cấu hình. Set BOT_TOKEN environment variable or edit file to add TOKEN.")
     else:
         bot.run(TOKEN)
+
