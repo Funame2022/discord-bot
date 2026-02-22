@@ -17,7 +17,7 @@ CONFIG_FILE = "config.json"
 MONITORED_IMAGE_PATH = "/mnt/data/93b3f5bc-2247-4f67-a02f-7eb4209abc2c.png"  # optional header image
 
 # fallback if guild has no log configured
-DEFAULT_LOG_CHANNEL_ID = 1213543309172154444
+DEFAULT_LOG_CHANNEL_ID = 1472491858096820277
 
 THRESHOLD_SECONDS = 300
 CHECK_INTERVAL_SECONDS = 180
@@ -1437,4 +1437,5 @@ if __name__ == "__main__":
         print("ERROR: BOT TOKEN chưa cấu hình. Set BOT_TOKEN environment variable or edit file to add TOKEN.")
     else:
         bot.run(TOKEN)
+
 
