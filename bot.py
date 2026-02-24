@@ -16,8 +16,8 @@ MONITORED_FILE = "monitored.json"
 CONFIG_FILE = "config.json"
 MONITORED_IMAGE_PATH = "/mnt/data/93b3f5bc-2247-4f67-a02f-7eb4209abc2c.png"
 
-THRESHOLD_SECONDS = 180
-CHECK_INTERVAL_SECONDS = 60
+THRESHOLD_SECONDS = 300
+CHECK_INTERVAL_SECONDS = 180
 AUTO_DELETE_SECONDS = 300
 UI_TEMP_DELETE_SECONDS = 10
 LOCAL_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
@@ -1970,5 +1970,6 @@ if __name__ == "__main__":
         print("ERROR: BOT TOKEN chưa cấu hình. Set DISCORD_TOKEN environment variable.")
     else:
         bot.run(TOKEN)
+
 
 
