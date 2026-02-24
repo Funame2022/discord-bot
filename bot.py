@@ -10,7 +10,7 @@ from discord.ext import tasks, commands
 
 # ------------------ CONFIGURATION ----------------
 # NOTE: Use environment variable DISCORD_TOKEN for the bot token.
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("DISCORD_TOKEN")
 BOT_GUILD_ID = os.getenv("BOT_GUILD_ID")
 MONITORED_FILE = "monitored.json"
 CONFIG_FILE = "config.json"
@@ -1970,4 +1970,5 @@ if __name__ == "__main__":
         print("ERROR: BOT TOKEN chưa cấu hình. Set DISCORD_TOKEN environment variable.")
     else:
         bot.run(TOKEN)
+
 
