@@ -3,7 +3,7 @@ import os
 import json
 import asyncio
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import discord
 from discord.ext import tasks, commands
@@ -16,9 +16,13 @@ MONITORED_FILE = "monitored.json"
 CONFIG_FILE = "config.json"
 MONITORED_IMAGE_PATH = "/mnt/data/93b3f5bc-2247-4f67-a02f-7eb4209abc2c.png"
 
+# Default alert threshold (how long since last message before sending an alert)
 THRESHOLD_SECONDS = 300
+
+# Default scanning interval (how often the bot scans). Can be changed with /st.
 CHECK_INTERVAL_SECONDS = 180
-AUTO_DELETE_SECONDS = 300
+
+AUTO_DELETE_SECONDS = 300          # non-alert bot messages in log channels will be auto-deleted
 UI_TEMP_DELETE_SECONDS = 10
 LOCAL_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
@@ -35,10 +39,17 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # In-memory structures
 monitored = {}           # channel_id -> record
-config = {}              # persisted per-guild config
+config = {}              # persisted per-guild config and global settings
 preserved_alerts = {}    # alerts preserved when monitor removed
 guild_locks = {}         # guild_id -> asyncio.Lock() for race-safety
 
+# Timer utilities (for remaining-time)
+next_check_time = None   # datetime of next scheduled check_loop run
+timer_task = None        # asyncio.Task for the remaining-time updater
+
+# Cache to avoid frequent edits (keyed by guild id)
+# Each value: {"last_str": "MM:SS", "last_update": datetime}
+remaining_cache = {}
 
 # ---------------- Persistence helpers ----------------
 def iso_dt(dt):
@@ -110,7 +121,12 @@ def save_config():
 
 
 def load_config():
-    global config
+    """
+    Loads config and applies persistent settings:
+    - ensures config structure and keys exist
+    - loads saved scan interval (if any) into global CHECK_INTERVAL_SECONDS
+    """
+    global config, CHECK_INTERVAL_SECONDS
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -118,15 +134,22 @@ def load_config():
             if isinstance(cfg, dict):
                 if "guilds" not in cfg:
                     ui = cfg.get("ui_channel_id")
-                    config = {"ui_channel_id": ui, "guilds": {}}
-                else:
-                    config = cfg
+                    cfg = {"ui_channel_id": ui, "guilds": {}}
+                # ensure remaining_msg_id exists for each guild entry
+                for gid, ent in cfg.get("guilds", {}).items():
+                    if isinstance(ent, dict) and "remaining_msg_id" not in ent:
+                        ent["remaining_msg_id"] = None
+                # load saved scan interval if present
+                if "scan_interval" in cfg and isinstance(cfg["scan_interval"], int):
+                    CHECK_INTERVAL_SECONDS = int(cfg["scan_interval"])
+                config = cfg
             else:
                 config = {"ui_channel_id": None, "guilds": {}}
             return
         except Exception as e:
             print("Failed to load config.json:", e)
-    config = {"ui_channel_id": None, "guilds": {}}
+    # default structure
+    config = {"ui_channel_id": None, "guilds": {}, "scan_interval": CHECK_INTERVAL_SECONDS}
     save_config()
 
 
@@ -136,7 +159,10 @@ def ensure_guild_entry(guild_id: int):
     if "guilds" not in config:
         config["guilds"] = {}
     if gid not in config["guilds"]:
-        config["guilds"][gid] = {"log_channel_id": None, "ui_channel_id": None, "monitored": []}
+        config["guilds"][gid] = {"log_channel_id": None, "ui_channel_id": None, "monitored": [], "remaining_msg_id": None}
+    else:
+        if "remaining_msg_id" not in config["guilds"][gid]:
+            config["guilds"][gid]["remaining_msg_id"] = None
     return config["guilds"][gid]
 
 
@@ -193,6 +219,41 @@ def get_guild_lock(guild_id: int):
     if guild_id not in guild_locks:
         guild_locks[guild_id] = asyncio.Lock()
     return guild_locks[guild_id]
+
+
+def get_guild_remaining_msg_id(guild_id: int):
+    ent = ensure_guild_entry(guild_id)
+    mid = ent.get("remaining_msg_id")
+    return int(mid) if mid else None
+
+
+def set_guild_remaining_msg_id(guild_id: int, message_id: int | None):
+    ent = ensure_guild_entry(guild_id)
+    ent["remaining_msg_id"] = int(message_id) if message_id else None
+    # Clear cache if message id removed or changed
+    if message_id is None:
+        remaining_cache.pop(str(guild_id), None)
+    else:
+        # initialize cache entry
+        remaining_cache.setdefault(str(guild_id), {"last_str": None, "last_update": None})
+    save_config()
+
+
+def set_global_scan_interval(seconds: int):
+    """
+    Set global CHECK_INTERVAL_SECONDS and persist to config.
+    Also update check_loop interval if running.
+    """
+    global CHECK_INTERVAL_SECONDS
+    CHECK_INTERVAL_SECONDS = max(1, int(seconds))
+    config["scan_interval"] = CHECK_INTERVAL_SECONDS
+    save_config()
+    # change running loop interval if running
+    try:
+        if check_loop.is_running():
+            check_loop.change_interval(seconds=CHECK_INTERVAL_SECONDS)
+    except Exception:
+        pass
 
 
 # ---------------- Utility ----------------
@@ -268,17 +329,422 @@ async def _delete_original_after(interaction: discord.Interaction, delay: int):
         pass
 
 
+# ---------------- Remaining-time embed builder (NO progress bar — only remaining time) ----------------
+def build_remaining_embed(guild_id: int, remaining_seconds: int):
+    rem = max(0, int(remaining_seconds))
+    mmss = f"{rem // 60:02d}:{rem % 60:02d}"
+    embed = discord.Embed(title="⏱️ Next scan countdown", color=0x3498DB, timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="Remaining", value=f"{mmss} ({rem}s)", inline=True)
+    embed.set_footer(text="Scan interval (seconds): " + str(CHECK_INTERVAL_SECONDS))
+    return embed
+
+
+# ---------------- View for remaining message (persistent) ----------------
+class RemainingView(discord.ui.View):
+    def __init__(self, timeout: int = None):
+        # persistent
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🔁 Scan now", style=discord.ButtonStyle.primary, custom_id="remaining_scan")
+    async def scan_now(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """
+        Manual scan triggered by a user pressing the button in the remaining-time message.
+        To avoid the "Đang suy nghĩ..." spinner, we respond immediately and run the scan in background.
+        """
+        guild = interaction.guild
+        if guild is None:
+            try:
+                await interaction.response.send_message("⚠️ Không thể quét (không có guild).", ephemeral=True)
+            except:
+                pass
+            return
+
+        # Respond immediately so the interaction doesn't time out / show thinking
+        try:
+            await interaction.response.send_message("🔁 Đã bắt đầu quét thủ công — kết quả sẽ được ghi vào log. Đếm ngược đã được đặt lại.", ephemeral=True, delete_after=6)
+        except Exception:
+            try:
+                await interaction.response.send_message("🔁 Đã bắt đầu quét thủ công.", ephemeral=True)
+            except:
+                pass
+
+        # schedule background task to perform scan and reset timer + remaining message
+        asyncio.create_task(manual_scan_and_reset(guild))
+
+
+async def manual_scan_and_reset(guild: discord.Guild):
+    """
+    Background task to perform a manual scan for a guild, then reset the next_check_time and update remaining message.
+    """
+    global next_check_time
+    try:
+        await perform_scan_for_guild(guild)
+    except Exception as e:
+        print(f"Error during manual_scan_for guild {guild.id}: {e}")
+    # reset countdown
+    next_check_time = datetime.now(timezone.utc) + timedelta(seconds=CHECK_INTERVAL_SECONDS)
+    # ensure/update remaining message
+    try:
+        await ensure_remaining_message_for_guild(guild.id)
+    except Exception:
+        pass
+
+
+# ---------------- Helpers to send messages into log channel ----------------
+async def send_in_log_channel(log_ch, content=None, embed=None, view=None, persistent=False):
+    """
+    Send a message into log_ch.
+    - If persistent True: message will not be auto-deleted (used for alerts & remaining message).
+    - If persistent False: message will be scheduled for auto-delete after AUTO_DELETE_SECONDS.
+    Returns message or None.
+    """
+    try:
+        sent = await log_ch.send(content=content, embed=embed, view=view)
+    except Exception as e:
+        print(f"Failed to send in log channel {getattr(log_ch, 'id', None)}: {e}")
+        return None
+
+    if not persistent:
+        try:
+            asyncio.create_task(_delete_message_later(log_ch, sent.id, AUTO_DELETE_SECONDS))
+        except Exception:
+            pass
+    return sent
+
+
+# ---------------- Ensure single remaining message exists / update ----------------
+async def ensure_remaining_message_for_guild(guild_id: int):
+    """
+    Ensure exactly one 'remaining-time' message exists in the configured log channel for this guild.
+    If missing, create it and save its message id in config.
+    If duplicates exist, keep one and delete the rest.
+    Note: Do NOT pin the message (per user request).
+    """
+    ent = ensure_guild_entry(guild_id)
+    log_ch_id = ent.get("log_channel_id")
+    if not log_ch_id:
+        return None
+
+    # Try to fetch channel
+    try:
+        log_ch = bot.get_channel(int(log_ch_id)) or await bot.fetch_channel(int(log_ch_id))
+    except Exception as e:
+        print(f"Cannot access log channel {log_ch_id} for remaining timer: {e}")
+        return None
+
+    # If there's already a message id configured, check it and ensure it exists in this channel
+    mid = ent.get("remaining_msg_id")
+    now = datetime.now(timezone.utc)
+    rem = CHECK_INTERVAL_SECONDS if next_check_time is None else max(0, int((next_check_time - now).total_seconds()))
+    embed = build_remaining_embed(guild_id, rem)
+    mmss = f"{max(0, rem) // 60:02d}:{max(0, rem) % 60:02d}"
+
+    if mid:
+        try:
+            msg = await log_ch.fetch_message(int(mid))
+            # update embed & view immediately (best-effort)
+            try:
+                await msg.edit(embed=embed, view=RemainingView())
+                # update cache
+                remaining_cache[str(guild_id)] = {"last_str": mmss, "last_update": datetime.now(timezone.utc)}
+            except Exception:
+                # If editing fails (maybe message deleted or moved), clear stored id and continue to find/create
+                set_guild_remaining_msg_id(guild_id, None)
+                raise
+            # delete any other bot remaining messages in this channel (duplicates)
+            try:
+                async for m in log_ch.history(limit=200):
+                    if m.id == msg.id:
+                        continue
+                    if m.author and m.author.id == bot.user.id and m.embeds:
+                        e = m.embeds[0]
+                        if e.title and "Next scan countdown" in e.title:
+                            try:
+                                await m.delete()
+                            except:
+                                pass
+            except Exception:
+                pass
+            return msg.id
+        except Exception:
+            # stored id invalid (deleted or moved) -> clear and continue
+            set_guild_remaining_msg_id(guild_id, None)
+
+    # Search recent messages for existing remaining message(s) authored by bot
+    candidates = []
+    try:
+        async for m in log_ch.history(limit=200):
+            if m.author and m.author.id == bot.user.id and m.embeds:
+                e = m.embeds[0]
+                if e.title and "Next scan countdown" in e.title:
+                    candidates.append(m)
+    except Exception:
+        candidates = []
+
+    # If we found candidates, keep the most recent one (first found) and delete others
+    if candidates:
+        chosen = candidates[0]
+        for c in candidates[1:]:
+            try:
+                await c.delete()
+            except:
+                pass
+        # update chosen embed & view and save id
+        try:
+            await chosen.edit(embed=embed, view=RemainingView())
+            remaining_cache[str(guild_id)] = {"last_str": mmss, "last_update": datetime.now(timezone.utc)}
+        except Exception:
+            pass
+        set_guild_remaining_msg_id(guild_id, chosen.id)
+        return chosen.id
+
+    # No existing message found -> create one (persistent)
+    try:
+        sent = await send_in_log_channel(log_ch, embed=embed, view=RemainingView(), persistent=True)
+        if not sent:
+            return None
+        set_guild_remaining_msg_id(guild_id, sent.id)
+        remaining_cache[str(guild_id)] = {"last_str": mmss, "last_update": datetime.now(timezone.utc)}
+        print(f"Created remaining-timer message {sent.id} in log channel {log_ch.id} for guild {guild_id}")
+        return sent.id
+    except Exception as e:
+        print(f"Failed to create remaining-timer message in channel {log_ch_id}: {e}")
+        return None
+
+
+# ---------------- Background updater for remaining messages ----------------
+async def update_remaining_messages_loop():
+    """
+    Background task: every 1 second evaluate whether to update remaining-time message(s) for guilds.
+    Uses per-guild throttling to avoid hitting API rate limits.
+    """
+    global next_check_time
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            if next_check_time is None:
+                base_remaining = CHECK_INTERVAL_SECONDS
+            else:
+                rem_td = (next_check_time - now)
+                base_remaining = max(0, int(rem_td.total_seconds()))
+
+            guilds = list(config.get("guilds", {}).items())
+            for gid, ent in guilds:
+                try:
+                    log_ch_id = ent.get("log_channel_id")
+                    if not log_ch_id:
+                        continue
+                    # ensure channel object
+                    try:
+                        log_ch = bot.get_channel(int(log_ch_id)) or await bot.fetch_channel(int(log_ch_id))
+                    except Exception:
+                        continue
+
+                    # Compute remaining for this guild — we assume a global next_check_time so same base_remaining applies,
+                    # but keep function in case next_check_time differs in future per-guild.
+                    remaining = base_remaining
+                    if remaining < 0:
+                        remaining = 0
+
+                    # decide update frequency based on remaining seconds
+                    if remaining > 300:
+                        min_interval = 30
+                    elif remaining > 60:
+                        min_interval = 10
+                    elif remaining > 10:
+                        min_interval = 5
+                    else:
+                        min_interval = 1
+
+                    key = str(gid)
+                    cache = remaining_cache.get(key)
+                    mmss = f"{remaining // 60:02d}:{remaining % 60:02d}"
+                    now_ts = datetime.now(timezone.utc)
+
+                    # If we have a cache entry and it's recent enough, skip
+                    if cache:
+                        last_update = cache.get("last_update")
+                        last_str = cache.get("last_str")
+                        if last_update and (now_ts - last_update).total_seconds() < min_interval:
+                            # skip update due to throttle
+                            continue
+                        if last_str == mmss and last_update:
+                            # content unchanged, but maybe enough time passed to update embed timestamp — we can skip to reduce edits
+                            # Only force update if last_update older than min_interval * 2 to refresh timestamp
+                            if (now_ts - last_update).total_seconds() < (min_interval * 2):
+                                continue
+
+                    # If we have a saved remaining message id, attempt to edit it; otherwise ensure it's created
+                    mid = ent.get("remaining_msg_id")
+                    if mid:
+                        try:
+                            msg = await log_ch.fetch_message(int(mid))
+                            embed = build_remaining_embed(int(gid), remaining)
+                            try:
+                                await msg.edit(embed=embed)
+                                # update cache
+                                remaining_cache[key] = {"last_str": mmss, "last_update": now_ts}
+                            except discord.HTTPException as e:
+                                # On any HTTP error (including 429), don't spam edits; clear saved id if message removed
+                                if e.status == 404:
+                                    set_guild_remaining_msg_id(int(gid), None)
+                                # otherwise just continue; discord.py will handle rate-limit backoff
+                                continue
+                        except discord.NotFound:
+                            # message deleted -> clear stored id and attempt to recreate below
+                            set_guild_remaining_msg_id(int(gid), None)
+                            try:
+                                await ensure_remaining_message_for_guild(int(gid))
+                            except Exception:
+                                pass
+                        except Exception:
+                            # Problem fetching -> try ensure to recreate if necessary
+                            try:
+                                await ensure_remaining_message_for_guild(int(gid))
+                            except Exception:
+                                pass
+                    else:
+                        # No stored id -> try to ensure/create
+                        try:
+                            await ensure_remaining_message_for_guild(int(gid))
+                        except Exception:
+                            pass
+
+                except Exception:
+                    # per-guild error should not stop the loop
+                    continue
+        except Exception as e:
+            print("Error in update_remaining_messages_loop:", e)
+        await asyncio.sleep(1)
+
+
+# ---------------- Core scanning logic (reused by check_loop & manual scan) ----------------
+async def perform_scan_for_guild(guild: discord.Guild):
+    """
+    Run one monitoring pass for a single guild. Used by manual scan and when check_loop runs.
+    """
+    now = datetime.now(timezone.utc)
+    gm_list = guild_monitored_list(guild.id)
+    for cid in list(gm_list):
+        try:
+            ch = bot.get_channel(cid) or await bot.fetch_channel(cid)
+            msgs = [m async for m in ch.history(limit=1)]
+            if not msgs:
+                continue
+            last_msg_time = msgs[0].created_at.replace(tzinfo=timezone.utc)
+            rec = monitored.get(cid)
+            if rec is None:
+                monitored[cid] = {
+                    "log_channel": None,
+                    "last_message_time": last_msg_time,
+                    "alert_count": 0,
+                    "alert_message_id": None,
+                    "alert_sent_time": None,
+                    "confirmed": False,
+                    "confirmed_by": None
+                }
+                save_monitored()
+                rec = monitored[cid]
+
+            # reset on new message
+            if rec.get("last_message_time") is None or last_msg_time != rec.get("last_message_time"):
+                rec["last_message_time"] = last_msg_time
+                rec["alert_count"] = 0
+                rec["confirmed"] = False
+                rec["confirmed_by"] = None
+
+                # delete old alert if existed and log channel known
+                if rec.get("alert_message_id"):
+                    try:
+                        log_ch_id = rec.get("log_channel") or get_guild_log_channel(ch.guild.id)
+                        if log_ch_id:
+                            log_ch = bot.get_channel(log_ch_id) or await bot.fetch_channel(log_ch_id)
+                            old = await log_ch.fetch_message(rec.get("alert_message_id"))
+                            try:
+                                await old.delete()
+                            except:
+                                pass
+                    except Exception:
+                        pass
+                    rec["alert_message_id"] = None
+                    rec["alert_sent_time"] = None
+                save_monitored()
+                continue
+
+            # skip confirmed
+            if rec.get("confirmed"):
+                continue
+
+            diff = (now - rec["last_message_time"]).total_seconds()
+            if diff > THRESHOLD_SECONDS:
+                # avoid very-frequent double alerts (short window)
+                if rec.get("alert_sent_time") and (now - rec["alert_sent_time"]).total_seconds() < 5:
+                    continue
+
+                rec["alert_count"] = rec.get("alert_count", 0) + 1
+                log_ch_id = rec.get("log_channel") or get_guild_log_channel(ch.guild.id)
+                if not log_ch_id:
+                    print(f"Skipping alert for {ch.name} (no log configured).")
+                    continue
+
+                try:
+                    log_ch = bot.get_channel(log_ch_id) or await bot.fetch_channel(log_ch_id)
+                except Exception as e:
+                    print(f"Cannot access log channel {log_ch_id} for monitor {cid}: {e}")
+                    continue
+
+                # delete old alert if exists
+                if rec.get("alert_message_id"):
+                    try:
+                        old = await log_ch.fetch_message(rec["alert_message_id"])
+                        try:
+                            await old.delete()
+                        except:
+                            pass
+                    except:
+                        pass
+
+                embed = discord.Embed(
+                    title=f"👉**{ch.name}**👈 quá {THRESHOLD_SECONDS//60} phút chưa xong Mission.",
+                    color=0xE74C3C,
+                    timestamp=now
+                )
+                embed.add_field(name="Last message", value=local_time_str(rec["last_message_time"]), inline=True)
+                embed.add_field(name="Delay", value=format_seconds(diff), inline=True)
+                embed.add_field(name="Thông báo lần", value=str(rec["alert_count"]), inline=True)
+
+                mention_parts = []
+                if PING_EVERYONE:
+                    mention_parts.append("@everyone")
+                if PING_ROLE_IDS:
+                    mention_parts.extend(f"<@&{rid}>" for rid in PING_ROLE_IDS)
+                content = " ".join(mention_parts) if mention_parts else None
+                allowed = discord.AllowedMentions(everyone=bool(PING_EVERYONE),
+                                                  roles=bool(PING_ROLE_IDS),
+                                                  users=False)
+                view = ConfirmView(cid)
+                try:
+                    sent = await send_in_log_channel(log_ch, content=content, embed=embed, view=view, persistent=True)
+                    if sent:
+                        rec["alert_message_id"] = sent.id
+                        rec["alert_sent_time"] = now
+                        save_monitored()
+                        print(f"Alert {rec['alert_count']} - {ch.name} -> sent to {log_ch.id}")
+                except Exception as e:
+                    print(f"Failed to send alert for {cid} to {log_ch_id}: {e}")
+        except Exception as e:
+            print(f"Error monitoring {cid} in guild {guild.id}: {e}")
+
+
 # ---------------- Confirm View (alerts in log channel) ----------------
 class ConfirmView(discord.ui.View):
-    def __init__(self, monitor_cid: int, *, timeout: int = None):
-        # Keep ConfirmView as-is (no change to behavior here)
+    def __init__(self, monitor_cid: int = None, *, timeout: int = None):
         super().__init__(timeout=None)
         self.monitor_cid = monitor_cid
 
     @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.success, custom_id="confirm_button")
     async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         user = interaction.user
-        # Permission check
         if not (user.guild_permissions.manage_channels or user.guild_permissions.administrator):
             try:
                 await interaction.response.send_message("❌ Bạn không có quyền xác nhận.", ephemeral=True, delete_after=5)
@@ -287,11 +753,9 @@ class ConfirmView(discord.ui.View):
             return
 
         cid = self.monitor_cid
-
-        # Determine guild lock to avoid race conditions
         guild_id = None
         try:
-            chobj = bot.get_channel(cid) or await bot.fetch_channel(cid)
+            chobj = bot.get_channel(cid) or (await bot.fetch_channel(cid) if cid else None)
             if chobj and getattr(chobj, "guild", None):
                 guild_id = chobj.guild.id
         except Exception:
@@ -300,7 +764,7 @@ class ConfirmView(discord.ui.View):
         lock = get_guild_lock(guild_id) if guild_id else asyncio.Lock()
 
         async with lock:
-            rec = monitored.get(cid)
+            rec = monitored.get(cid) if cid else None
             preserved = None
             if rec is None:
                 preserved = preserved_alerts.get(cid)
@@ -354,22 +818,20 @@ class ConfirmView(discord.ui.View):
             except:
                 pass
 
-        # Note: alert deletion/reset is handled by check_loop when a new message is observed.
 
+# ---------------- Remaining UI, Add/Remove/SetLog/List/MassCreate Views & Commands ----------------
+# (Implementations are the same as prior but use ensure_remaining_message_for_guild to avoid duplicates)
 
-# ---------------- Add / Remove Select Views (per-user ephemeral, isolated) ----------------
 class RemoveSelectView(discord.ui.View):
     def __init__(self, guild: discord.Guild, requester: discord.Member, *, timeout: int = None):
-        # Use a limited timeout to avoid persistent-view issues across restarts
         super().__init__(timeout=300)
         self.guild = guild
         self.requester = requester
-        self._orig_message = None  # will be set by ConfigView if possible
+        self._orig_message = None
         self.selected = []
-        self._build_options()  # build initial options from guild monitored list
+        self._build_options()
 
     def _build_options(self, options: list = None):
-        # remove existing selects
         for item in list(self.children):
             if isinstance(item, discord.ui.Select):
                 try:
@@ -392,7 +854,6 @@ class RemoveSelectView(discord.ui.View):
             self.no_options = True
             return
         self.no_options = False
-        # create select with dynamic max_values
         maxv = min(25, len(opts))
         self.sel = discord.ui.Select(placeholder="Chọn channel (tối đa 25) để xóa...", options=opts[:25], min_values=1, max_values=maxv)
         self.sel.callback = self._sel_cb
@@ -413,7 +874,6 @@ class RemoveSelectView(discord.ui.View):
 
     @discord.ui.button(label="Chọn tất cả", style=discord.ButtonStyle.secondary, custom_id="remove_select_all")
     async def select_all_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # permission
         if interaction.user.id != self.requester.id and not (interaction.user.guild_permissions.manage_channels or interaction.user.guild_permissions.administrator):
             await interaction.response.send_message("❌ Bạn không có quyền.", ephemeral=True, delete_after=5)
             return
@@ -423,10 +883,8 @@ class RemoveSelectView(discord.ui.View):
             except:
                 pass
             return
-        # select all values
         values = [opt.value for opt in self.sel.options]
         self.selected = [int(v) for v in values]
-        # mark defaults so UI shows selection
         new_opts = [discord.SelectOption(label=o.label, value=o.value, description=o.description, default=True) for o in self.sel.options]
         self.sel.options = new_opts
         try:
@@ -478,7 +936,6 @@ class RemoveSelectView(discord.ui.View):
                     return
                 limited = matches[:25]
 
-                # Try to update the existing ephemeral view in-place (preferred)
                 updated_embed = discord.Embed(
                     title="Remove monitor — Search results",
                     description=f"**Kết quả:** \"{q}\" — {len(matches)} (hiển thị tối đa 25)\nChọn rồi bấm Delete.",
@@ -486,10 +943,7 @@ class RemoveSelectView(discord.ui.View):
                     timestamp=datetime.now(timezone.utc)
                 )
                 try:
-                    # update parent view options
                     self.parent_view._build_options(options=limited)
-
-                    # if we have original message, edit it in-place
                     if getattr(self.parent_view, "_orig_message", None):
                         try:
                             await self.parent_view._orig_message.edit(embed=updated_embed, view=self.parent_view)
@@ -500,8 +954,6 @@ class RemoveSelectView(discord.ui.View):
                             return
                         except Exception:
                             pass
-
-                    # fallback: try to edit the modal's interaction response (if possible)
                     try:
                         await modal_interaction.response.edit_message(embed=updated_embed, view=self.parent_view)
                         try:
@@ -511,8 +963,6 @@ class RemoveSelectView(discord.ui.View):
                         return
                     except Exception:
                         pass
-
-                    # last fallback: send a new ephemeral message with the results (safe)
                     new_view = RemoveSelectView(self.parent_view.guild, self.parent_view.requester)
                     if not getattr(new_view, "no_options", False) and getattr(new_view, "sel", None):
                         new_view.sel.options = limited
@@ -575,7 +1025,7 @@ class RemoveSelectView(discord.ui.View):
                             alert_time = old.created_at if getattr(old, 'created_at', None) else None
                             if alert_time and alert_time.tzinfo is None:
                                 alert_time = alert_time.replace(tzinfo=timezone.utc)
-                            if alert_time and (now - alert_time).total_seconds() > THRESHOLD_SECONDS:
+                            if alert_time and (now - alert_time).total_seconds() > CHECK_INTERVAL_SECONDS:
                                 preserved_alerts[cid] = {"log_channel": log_ch.id, "alert_message_id": old.id, "alert_sent_time": alert_time}
                                 preserved.append(cid)
                             else:
@@ -631,23 +1081,20 @@ class RemoveSelectView(discord.ui.View):
 
 class AddSelectView(discord.ui.View):
     def __init__(self, guild: discord.Guild, requester: discord.Member, *, timeout: int = None):
-        # Use a limited timeout to avoid persistent-view issues across restarts
         super().__init__(timeout=300)
         self.guild = guild
         self.requester = requester
-        self._orig_message = None  # will be set by ConfigView if possible
+        self._orig_message = None
         self.selected = []
         self._build_options()
 
     def _build_options(self, options: list = None):
-        # remove existing selects
         for item in list(self.children):
             if isinstance(item, discord.ui.Select):
                 try:
                     self.remove_item(item)
                 except Exception:
                     pass
-
         opts = []
         if options is None:
             for ch in self.guild.channels:
@@ -661,7 +1108,6 @@ class AddSelectView(discord.ui.View):
                 opts.append(discord.SelectOption(label=ch.name, value=str(ch.id), description=f"{kind} • {ch.id}"))
         else:
             opts = options
-
         if not opts:
             self.no_options = True
             return
@@ -686,7 +1132,6 @@ class AddSelectView(discord.ui.View):
 
     @discord.ui.button(label="Chọn tất cả", style=discord.ButtonStyle.secondary, custom_id="add_select_all")
     async def select_all_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # permission
         if interaction.user.id != self.requester.id and not (interaction.user.guild_permissions.manage_channels or interaction.user.guild_permissions.administrator):
             await interaction.response.send_message("❌ Bạn không có quyền.", ephemeral=True, delete_after=5)
             return
@@ -750,18 +1195,14 @@ class AddSelectView(discord.ui.View):
                         pass
                     return
                 limited = matches[:25]
-
                 updated_embed = discord.Embed(
                     title="Add monitor — Search results",
                     description=f"**Kết quả:** \"{q}\" — {len(matches)} (hiển thị tối đa 25)\nChọn rồi bấm Add.",
                     color=0x95A5A6,
                     timestamp=datetime.now(timezone.utc)
                 )
-
                 try:
-                    # update options on parent view
                     self.parent_view._build_options(options=limited)
-
                     if getattr(self.parent_view, "_orig_message", None):
                         try:
                             await self.parent_view._orig_message.edit(embed=updated_embed, view=self.parent_view)
@@ -772,7 +1213,6 @@ class AddSelectView(discord.ui.View):
                             return
                         except Exception:
                             pass
-
                     try:
                         await modal_interaction.response.edit_message(embed=updated_embed, view=self.parent_view)
                         try:
@@ -782,8 +1222,6 @@ class AddSelectView(discord.ui.View):
                         return
                     except Exception:
                         pass
-
-                    # fallback: send new ephemeral message with results
                     new_view = AddSelectView(self.parent_view.guild, self.parent_view.requester)
                     if not getattr(new_view, "no_options", False) and getattr(new_view, "sel", None):
                         new_view.sel.options = limited
@@ -902,29 +1340,24 @@ class AddSelectView(discord.ui.View):
             self.stop()
 
 
-# ---------------- SetLogView (ephemeral per-user) -- fixed to update in-place ----------------
 class SetLogView(discord.ui.View):
     def __init__(self, guild: discord.Guild, requester: discord.Member, *, timeout: int = None):
-        # Use limited timeout to avoid persistent registration problems
         super().__init__(timeout=300)
         self.guild = guild
         self.requester = requester
         self.selected_log = None
-        self._orig_message = None  # will be set by the sender (ConfigView) when possible
+        self._orig_message = None
         self._build_options()
 
     def _build_options(self, options: list = None):
-        # remove existing selects
         for item in list(self.children):
             if isinstance(item, discord.ui.Select):
                 try:
                     self.remove_item(item)
                 except Exception:
                     pass
-
         current_log_id = get_guild_log_channel(self.guild.id)
         opts = []
-
         if options is None:
             for ch in self.guild.channels:
                 if isinstance(ch, discord.CategoryChannel):
@@ -937,12 +1370,10 @@ class SetLogView(discord.ui.View):
                 opts.append(discord.SelectOption(label=ch.name, value=str(ch.id), description=f"{kind} • {ch.id}"))
         else:
             opts = options
-
         if not opts:
             self.no_options = True
             return
         self.no_options = False
-
         self.log_select = discord.ui.Select(
             placeholder="Chọn channel làm log cho server...",
             options=opts[:25],
@@ -970,16 +1401,12 @@ class SetLogView(discord.ui.View):
         if interaction.user.id != self.requester.id and not (interaction.user.guild_permissions.manage_channels or interaction.user.guild_permissions.administrator):
             await interaction.response.send_message("❌ Bạn không có quyền.", ephemeral=True, delete_after=5)
             return
-
         parent_view = self
-
         class SearchModal(discord.ui.Modal, title="Search channels"):
             query = discord.ui.TextInput(label="Tên channel (một phần)", required=True, max_length=100)
-
             def __init__(self, parent_view: "SetLogView"):
                 super().__init__()
                 self.parent_view = parent_view
-
             async def on_submit(self, modal_interaction: discord.Interaction):
                 q = self.query.value.strip().lower()
                 if not q:
@@ -988,7 +1415,6 @@ class SetLogView(discord.ui.View):
                     except:
                         pass
                     return
-
                 matches = []
                 cur = get_guild_log_channel(self.parent_view.guild.id)
                 for ch in self.parent_view.guild.channels:
@@ -1001,26 +1427,21 @@ class SetLogView(discord.ui.View):
                     if q in ch.name.lower():
                         kind = "voice" if isinstance(ch, discord.VoiceChannel) else "text"
                         matches.append(discord.SelectOption(label=ch.name, value=str(ch.id), description=f"{kind} • {ch.id}"))
-
                 if not matches:
                     try:
                         await modal_interaction.response.send_message("Không tìm thấy channel.", ephemeral=True, delete_after=6)
                     except:
                         pass
                     return
-
                 limited = matches[:25]
-
                 try:
                     self.parent_view._build_options(options=limited)
-
                     updated_embed = discord.Embed(
                         title="Set log — Search results",
                         description=f"**Kết quả:** \"{q}\" — {len(matches)} (hiển thị tối đa 25)\nChọn rồi bấm Set log.",
                         color=0x95A5A6,
                         timestamp=datetime.now(timezone.utc)
                     )
-
                     if getattr(self.parent_view, "_orig_message", None):
                         try:
                             await self.parent_view._orig_message.edit(embed=updated_embed, view=self.parent_view)
@@ -1031,7 +1452,6 @@ class SetLogView(discord.ui.View):
                             return
                         except Exception:
                             pass
-
                     try:
                         await modal_interaction.response.edit_message(embed=updated_embed, view=self.parent_view)
                         try:
@@ -1041,18 +1461,15 @@ class SetLogView(discord.ui.View):
                         return
                     except Exception:
                         pass
-
                     try:
                         await modal_interaction.response.send_message("⚠️ Đã tìm thấy kết quả nhưng không thể cập nhật giao diện (không có quyền sửa message gốc).", ephemeral=True, delete_after=8)
                     except:
                         pass
-
                 except Exception as e:
                     try:
                         await modal_interaction.response.send_message(f"Không thể cập nhật dropdown: {e}", ephemeral=True, delete_after=6)
                     except:
                         pass
-
         try:
             await interaction.response.send_modal(SearchModal(parent_view))
         except Exception as e:
@@ -1067,7 +1484,6 @@ class SetLogView(discord.ui.View):
             await interaction.response.defer(thinking=True, ephemeral=True)
         except:
             pass
-
         if interaction.user.id != self.requester.id and not (interaction.user.guild_permissions.manage_channels or interaction.user.guild_permissions.administrator):
             msg = await interaction.followup.send("❌ Bạn không có quyền.", ephemeral=True)
             asyncio.create_task(_delete_message_obj_later(msg, UI_TEMP_DELETE_SECONDS))
@@ -1087,7 +1503,44 @@ class SetLogView(discord.ui.View):
             asyncio.create_task(_delete_message_obj_later(msg, UI_TEMP_DELETE_SECONDS))
             return
 
+        prev_log_id = get_guild_log_channel(self.guild.id)
+        prev_remaining_mid = get_guild_remaining_msg_id(self.guild.id)
+
+        # set the new log channel first (persist)
         set_guild_log_channel(self.guild.id, self.selected_log)
+
+        # If previous log channel exists and is different, delete ALL messages there (per user request),
+        # including the previous remaining message. Attempt bulk purge first, fallback to manual deletion.
+        if prev_log_id and prev_log_id != self.selected_log:
+            try:
+                prev_ch = bot.get_channel(prev_log_id) or await bot.fetch_channel(prev_log_id)
+                # try bulk purge (best-effort)
+                try:
+                    # purge will attempt to bulk-delete recent messages (requires Manage Messages)
+                    await prev_ch.purge(limit=1000)
+                except Exception:
+                    # fallback: iterate and delete individually
+                    try:
+                        async for m in prev_ch.history(limit=1000):
+                            try:
+                                await m.delete()
+                            except:
+                                pass
+                    except Exception:
+                        pass
+                # clear stored remaining message id for this guild
+                try:
+                    set_guild_remaining_msg_id(self.guild.id, None)
+                except:
+                    pass
+            except Exception:
+                pass
+
+        # ensure the remaining message exists in new log channel (will reuse existing bot message if present)
+        try:
+            await ensure_remaining_message_for_guild(self.guild.id)
+        except Exception as e:
+            print(f"Error ensuring remaining message for guild {self.guild.id}: {e}")
 
         desc = f"✅ Đã gán log cho server: <#{self.selected_log}>.\n(Lưu ý: log là cấu hình cấp server, không gán cho từng monitor.)"
         embed = discord.Embed(title="Set log", description=desc, color=0x2ECC71, timestamp=datetime.now(timezone.utc))
@@ -1100,7 +1553,6 @@ class SetLogView(discord.ui.View):
                 asyncio.create_task(_delete_message_obj_later(msg, UI_TEMP_DELETE_SECONDS))
             except:
                 pass
-
         self.selected_log = None
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, custom_id="setlog_cancel")
@@ -1121,14 +1573,12 @@ class SetLogView(discord.ui.View):
             self.stop()
 
 
-# ---------------- MassCreate Modal (unchanged behavior, ephemeral ack, auto-delete ack)
-# NOTE: base_name is now optional (required=False). If empty, generated channel names will be numbers only.
 class MassCreateModal(discord.ui.Modal, title="Create multiple channels"):
-    base_name = discord.ui.TextInput(label="Base name (optional)" ,placeholder= "<YOUR BASE NAME> <START INDEX>" , required=False, max_length=100)
+    base_name = discord.ui.TextInput(label="Base name (optional)", placeholder="<YOUR BASE NAME> <START INDEX>", required=False, max_length=100)
     count = discord.ui.TextInput(label="Count", required=True, max_length=6)
-    chan_type = discord.ui.TextInput(label="Channel type",placeholder= "text or voice channel", required=False, max_length=10)
-    start = discord.ui.TextInput(label="Start index", placeholder= "Channel's numberic start from <START INDEX>" , required=False, max_length=6)
-    category = discord.ui.TextInput(label="Category (mention or id)" ,placeholder= "PASTE <CATEROGY ID>" , required=False, max_length=100)
+    chan_type = discord.ui.TextInput(label="Channel type", placeholder="text or voice channel", required=False, max_length=10)
+    start = discord.ui.TextInput(label="Start index", placeholder="Channel's numberic start from <START INDEX>", required=False, max_length=6)
+    category = discord.ui.TextInput(label="Category (mention or id)", placeholder="PASTE <CATEROGY ID>", required=False, max_length=100)
 
     async def on_submit(self, interaction: discord.Interaction):
         user = interaction.user
@@ -1170,13 +1620,11 @@ class MassCreateModal(discord.ui.Modal, title="Create multiple channels"):
             asyncio.create_task(_delete_original_after(interaction, UI_TEMP_DELETE_SECONDS))
         except:
             pass
-        # pass base_name possibly empty to do_masscreate
         asyncio.create_task(do_masscreate(interaction.guild, notify_channel, base_name, count, chan_type, start, padding, category_id, user))
 
 
 async def do_masscreate(guild, notify_channel, base_name, count, chan_type, start, padding, category_id, author):
     created, failed = [], []
-    # compute padding
     if padding <= 0:
         max_index = start + count - 1
         padding = len(str(max_index))
@@ -1250,7 +1698,7 @@ async def do_masscreate(guild, notify_channel, base_name, count, chan_type, star
             pass
 
 
-# ---------------- ListMonitorsView (ephemeral, paginated per-user) ----------------
+# ---------------- ListMonitorsView & ConfigView (unchanged, keep same behaviour) ----------------
 class ListMonitorsView(discord.ui.View):
     SORT_OPTIONS = [
         ("name_asc", "Tên (A → Z)"),
@@ -1262,11 +1710,9 @@ class ListMonitorsView(discord.ui.View):
         ("numeric_asc", "Theo số (tăng dần)"),
         ("numeric_desc", "Theo số (giảm dần)")
     ]
-
     DEFAULT_PAGE_SIZES = ["5", "10", "20", "100"]
 
     def __init__(self, guild: discord.Guild, requester: discord.Member, *, page_size: int = 10, sort: str = "name_asc", timeout: int = None):
-        # Use limited timeout
         super().__init__(timeout=300)
         self.guild = guild
         self.requester = requester
@@ -1274,15 +1720,11 @@ class ListMonitorsView(discord.ui.View):
         self.sort = sort
         self.page = 1
         self._rebuild_items()
-
-        # page size select
         size_opts = [discord.SelectOption(label=f"{v} / trang", value=v) for v in self.DEFAULT_PAGE_SIZES]
         size_opts = [discord.SelectOption(label=o.label, value=o.value, default=(o.value == str(self.page_size))) for o in size_opts]
         self.size_select = discord.ui.Select(placeholder=f"Page size: {self.page_size}", options=size_opts, min_values=1, max_values=1)
         self.size_select.callback = self.on_size_change
         self.add_item(self.size_select)
-
-        # sort select
         sort_opts = [discord.SelectOption(label=label, value=value, default=(value == self.sort)) for value, label in self.SORT_OPTIONS]
         self.sort_select = discord.ui.Select(placeholder="Sắp xếp", options=sort_opts, min_values=1, max_values=1)
         self.sort_select.callback = self.on_sort_change
@@ -1306,20 +1748,16 @@ class ListMonitorsView(discord.ui.View):
         def key_name(t):
             cid, ch, rec = t
             return (ch.name.lower() if ch else str(cid))
-
         def key_lastmsg(t):
             cid, ch, rec = t
             dt = rec.get("last_message_time") if rec else None
             return dt or datetime(1970, 1, 1, tzinfo=timezone.utc)
-
         def key_alerts(t):
             cid, ch, rec = t
             return rec.get("alert_count", 0) if rec else 0
-
         def key_confirmed_first(t):
             cid, ch, rec = t
             return not (rec and rec.get("confirmed"))
-
         def extract_first_int(name: str):
             if not name:
                 return None
@@ -1330,7 +1768,6 @@ class ListMonitorsView(discord.ui.View):
                 return int(m.group(0))
             except:
                 return None
-
         if self.sort == "name_asc":
             self.items.sort(key=key_name)
         elif self.sort == "name_desc":
@@ -1479,7 +1916,6 @@ class ListMonitorsView(discord.ui.View):
         return embed
 
 
-# ---------------- Main UI helpers ----------------
 def generate_main_embed():
     embed = discord.Embed(
         title="Cấu hình <Check messages> (Beta)",
@@ -1494,9 +1930,7 @@ def generate_main_embed():
 
 
 class ConfigView(discord.ui.View):
-    """The shared public UI that users can click — but every action opens an EPHEMERAL private view for the clicking user."""
     def __init__(self, *, timeout: int = None):
-        # Keep ConfigView persistent so the public message can be interacted with while bot runs.
         super().__init__(timeout=None)
 
     @discord.ui.button(label="📜List", style=discord.ButtonStyle.primary, custom_id="cm_list")
@@ -1511,7 +1945,6 @@ class ConfigView(discord.ui.View):
             except:
                 pass
             return
-
         view = ListMonitorsView(interaction.guild, interaction.user, page_size=10, sort="name_asc")
         try:
             await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
@@ -1536,7 +1969,6 @@ class ConfigView(discord.ui.View):
         embed = discord.Embed(title="➕ Thêm monitor", description="Chọn các channel để thêm vào monitor (private với bạn), sau đó bấm **Add** hoặc **Cancel**.", color=0x2ECC71, timestamp=datetime.now(timezone.utc))
         try:
             await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-            # store original message so modal can edit it later when searching
             try:
                 orig_msg = await interaction.original_response()
                 view._orig_message = orig_msg
@@ -1563,7 +1995,6 @@ class ConfigView(discord.ui.View):
         embed = discord.Embed(title="🗑️ Xóa monitor", description="Chọn các channel cần xóa khỏi monitor (private với bạn), sau đó bấm **Delete** hoặc **Cancel**.", color=0xE74C3C, timestamp=datetime.now(timezone.utc))
         try:
             await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-            # store original message reference for in-place search updates
             try:
                 orig_msg = await interaction.original_response()
                 view._orig_message = orig_msg
@@ -1664,6 +2095,7 @@ async def post_ui_to_channel(channel_id: int, *, guild: discord.Guild = None):
 # ---------------- on_ready & monitoring loop ----------------
 @bot.event
 async def on_ready():
+    global next_check_time, timer_task
     print(f"Bot ready: {bot.user} (id: {bot.user.id})")
     load_config()
     load_monitored()
@@ -1681,11 +2113,35 @@ async def on_ready():
             print(f"Init: cannot access channel {cid}: {e}")
             monitored[cid]["last_message_time"] = datetime.now(timezone.utc)
 
-    # Register the public ConfigView so its buttons work on the public message
+    # Register persistent views
     try:
         bot.add_view(ConfigView())
     except Exception:
         pass
+    try:
+        bot.add_view(ConfirmView(None))
+    except Exception:
+        pass
+    try:
+        bot.add_view(RemainingView())
+    except Exception:
+        pass
+
+    # Ensure remaining-message exists for configured guilds
+    for gid, ent in config.get("guilds", {}).items():
+        try:
+            gid_int = int(gid)
+            if ent.get("log_channel_id"):
+                try:
+                    await ensure_remaining_message_for_guild(gid_int)
+                except Exception as e:
+                    print(f"Error ensuring remaining message for guild {gid}: {e}")
+        except Exception:
+            continue
+
+    # start the remaining-message updater background task if not running
+    if timer_task is None or timer_task.done():
+        timer_task = asyncio.create_task(update_remaining_messages_loop())
 
     try:
         if BOT_GUILD_ID:
@@ -1698,116 +2154,38 @@ async def on_ready():
     except Exception as e:
         print("Failed to sync app commands:", e)
 
-    if not check_loop.is_running():
-        check_loop.start()
+    # set next_check_time to now + interval so countdown begins immediately
+    next_check_time = datetime.now(timezone.utc) + timedelta(seconds=CHECK_INTERVAL_SECONDS)
+
+    # start the periodic scanner (uses configured interval)
+    try:
+        if not check_loop.is_running():
+            check_loop.start()
+    except Exception as e:
+        print("Failed to start check_loop:", e)
 
 
 @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
 async def check_loop():
-    now = datetime.now(timezone.utc)
-    for cid in list(monitored.keys()):
+    """
+    Global periodic scanner. It sets next_check_time at the top of the run so the remaining-time updater can count down.
+    """
+    global next_check_time
+    # set next run time at start (so update loop sees correct remaining immediately)
+    next_check_time = datetime.now(timezone.utc) + timedelta(seconds=CHECK_INTERVAL_SECONDS)
+
+    # perform scan per guild
+    guilds = list(config.get("guilds", {}).keys())
+    for gid in guilds:
         try:
-            ch = bot.get_channel(cid) or await bot.fetch_channel(cid)
-            msgs = [m async for m in ch.history(limit=1)]
-            if not msgs:
+            gid_int = int(gid)
+            try:
+                guild = bot.get_guild(gid_int) or await bot.fetch_guild(gid_int)
+            except Exception:
                 continue
-            last_msg_time = msgs[0].created_at.replace(tzinfo=timezone.utc)
-            rec = monitored.get(cid)
-            if rec is None:
-                monitored[cid] = {
-                    "log_channel": None,
-                    "last_message_time": last_msg_time,
-                    "alert_count": 0,
-                    "alert_message_id": None,
-                    "alert_sent_time": None,
-                    "confirmed": False,
-                    "confirmed_by": None
-                }
-                save_monitored()
-                rec = monitored[cid]
-
-            # reset on new message
-            if rec.get("last_message_time") is None or last_msg_time != rec.get("last_message_time"):
-                rec["last_message_time"] = last_msg_time
-                rec["alert_count"] = 0
-                rec["confirmed"] = False
-                rec["confirmed_by"] = None
-
-                # delete old alert if existed and log channel known
-                if rec.get("alert_message_id"):
-                    try:
-                        log_ch_id = rec.get("log_channel") or get_guild_log_channel(ch.guild.id)
-                        if log_ch_id:
-                            log_ch = bot.get_channel(log_ch_id) or await bot.fetch_channel(log_ch_id)
-                            old = await log_ch.fetch_message(rec.get("alert_message_id"))
-                            await old.delete()
-                    except:
-                        pass
-                    rec["alert_message_id"] = None
-                    rec["alert_sent_time"] = None
-                save_monitored()
-                continue
-
-            # skip confirmed
-            if rec.get("confirmed"):
-                continue
-
-            diff = (now - rec["last_message_time"]).total_seconds()
-            if diff > THRESHOLD_SECONDS:
-                # avoid very-frequent double alerts
-                if rec.get("alert_sent_time") and (now - rec["alert_sent_time"]).total_seconds() < 5:
-                    continue
-
-                rec["alert_count"] = rec.get("alert_count", 0) + 1
-                log_ch_id = rec.get("log_channel") or get_guild_log_channel(ch.guild.id)
-                if not log_ch_id:
-                    print(f"Skipping alert for {ch.name} (no log configured).")
-                    continue
-
-                try:
-                    log_ch = bot.get_channel(log_ch_id) or await bot.fetch_channel(log_ch_id)
-                except Exception as e:
-                    print(f"Cannot access log channel {log_ch_id} for monitor {cid}: {e}")
-                    continue
-
-                # delete old alert if exists
-                if rec.get("alert_message_id"):
-                    try:
-                        old = await log_ch.fetch_message(rec["alert_message_id"])
-                        await old.delete()
-                    except:
-                        pass
-
-                embed = discord.Embed(
-                    title=f"👉**{ch.name}**👈 quá {THRESHOLD_SECONDS//60} phút chưa xong Mission.",
-                    color=0xE74C3C,
-                    timestamp=now
-                )
-                embed.add_field(name="Last message", value=local_time_str(rec["last_message_time"]), inline=True)
-                embed.add_field(name="Delay", value=format_seconds(diff), inline=True)
-                embed.add_field(name="Thông báo lần", value=str(rec["alert_count"]), inline=True)
-
-                mention_parts = []
-                if PING_EVERYONE:
-                    mention_parts.append("@everyone")
-                if PING_ROLE_IDS:
-                    mention_parts.extend(f"<@&{rid}>" for rid in PING_ROLE_IDS)
-                content = " ".join(mention_parts) if mention_parts else None
-                allowed = discord.AllowedMentions(everyone=bool(PING_EVERYONE),
-                                                  roles=bool(PING_ROLE_IDS),
-                                                  users=False)
-                view = ConfirmView(cid)
-                try:
-                    sent = await log_ch.send(content=content, embed=embed, allowed_mentions=allowed, view=view)
-                    rec["alert_message_id"] = sent.id
-                    rec["alert_sent_time"] = now
-                    save_monitored()
-                    # NOTE: do not auto-delete; alert remains until check_loop sees a new message.
-                    print(f"Alert {rec['alert_count']} - {ch.name} -> sent to {log_ch.id}")
-                except Exception as e:
-                    print(f"Failed to send alert for {cid} to {log_ch_id}: {e}")
+            await perform_scan_for_guild(guild)
         except Exception as e:
-            print(f"Error monitoring {cid}: {e}")
+            print(f"Error running scan for guild {gid}: {e}")
 
 
 # ---------------- Management commands (kept simple) ----------------
@@ -1820,16 +2198,10 @@ async def monitor_group(ctx):
 @bot.command(name="masscreate")
 @commands.has_guild_permissions(manage_channels=True)
 async def masscreate(ctx, base_name: str, count: int, chan_type: str = "text", start: int = 1, padding: int = 0, category: str = None):
-    """
-    Note: CLI usage remains the same: !masscreate <base_name> <count> ...
-    To create numeric-only names via CLI, pass an empty string for base_name (if your shell/client supports),
-    or pass '-' and it will be treated as empty.
-    """
-    # normalize base_name: treat '-' as empty and allow empty string
+    # same as earlier implementation
     if base_name == "-":
         base_name = ""
     base_name = (base_name or "").strip()
-
     if count <= 0:
         await ctx.reply("❌ count phải là số dương.", mention_author=False)
         return
@@ -1840,12 +2212,10 @@ async def masscreate(ctx, base_name: str, count: int, chan_type: str = "text", s
     if guild is None:
         await ctx.reply("❌ Lệnh chỉ dùng trong server (guild).", mention_author=False)
         return
-
     current_channels = len(guild.channels)
     if current_channels + count > 500:
         await ctx.reply(f"❌ Không thể tạo {count} channel — server hiện có {current_channels} channel; giới hạn ~500.", mention_author=False)
         return
-
     chan_type = (chan_type or "text").lower()
     is_voice = chan_type.startswith("v")
     try:
@@ -1856,7 +2226,6 @@ async def masscreate(ctx, base_name: str, count: int, chan_type: str = "text", s
         padding = int(padding)
     except:
         padding = 0
-
     category_obj = None
     if category:
         cid = parse_channel_argument(category)
@@ -1872,11 +2241,9 @@ async def masscreate(ctx, base_name: str, count: int, chan_type: str = "text", s
         except Exception as e:
             await ctx.reply(f"❌ Không thể truy cập category: {e}", mention_author=False)
             return
-
     if padding <= 0:
         max_index = start + count - 1
         padding = len(str(max_index))
-
     created = []
     failed = []
     if base_name:
@@ -1884,7 +2251,6 @@ async def masscreate(ctx, base_name: str, count: int, chan_type: str = "text", s
     else:
         start_display = f"{start}"
     await ctx.reply(f"⏳ Bắt đầu tạo {count} {'voice' if is_voice else 'text'} channel từ `{start_display}` ... (padding={padding})", mention_author=False, delete_after=UI_TEMP_DELETE_SECONDS)
-
     for i in range(start, start + count):
         number_str = str(i).zfill(padding) if padding > 0 else str(i)
         if base_name:
@@ -1912,15 +2278,13 @@ async def masscreate(ctx, base_name: str, count: int, chan_type: str = "text", s
         except Exception as e:
             failed.append((chan_name, str(e)))
             await asyncio.sleep(0.5)
-
     summary = f"✅ Hoàn thành. Tạo được {len(created)}/{count} channel."
     if failed:
         summary += f" Thất bại: {len(failed)}.\nCác lỗi mẫu: {failed[:5]}"
-
     await ctx.reply(summary, mention_author=False, delete_after=UI_TEMP_DELETE_SECONDS)
 
 
-# ---------------- Slash command entrypoint for interactive UI ----------------
+# ---------------- Slash commands: cmconfig, cmsetup (unchanged) & /st ----------------
 @bot.tree.command(name="cmconfig", description="Interactive monitor configuration")
 async def cmconfig(interaction: discord.Interaction):
     if not (interaction.user.guild_permissions.manage_channels or interaction.user.guild_permissions.administrator):
@@ -1962,6 +2326,58 @@ async def cmsetup(interaction: discord.Interaction, channel: str):
         await interaction.response.send_message(f"⚠️ Đã lưu <#{cid}> làm channel giao diện nhưng không thể đăng (kiểm tra quyền).", ephemeral=True, delete_after=8)
 
 
+@bot.tree.command(name="st", description="/st <seconds> — set global scan interval in seconds and restart countdown")
+async def st_command(interaction: discord.Interaction, seconds: int):
+    """
+    Sets the global scan interval (CHECK_INTERVAL_SECONDS) in seconds.
+    Requires Manage Channels permission.
+    Behavior:
+    - Updates global scan interval and persists it.
+    - Resets countdown (next_check_time) so the next run occurs after the new interval.
+    - Updates remaining-time messages immediately.
+    - Runs an immediate scan and keeps schedule.
+    """
+    if not (interaction.user.guild_permissions.manage_channels or interaction.user.guild_permissions.administrator):
+        await interaction.response.send_message("Bạn cần quyền Manage Channels để sử dụng lệnh này.", ephemeral=True, delete_after=6)
+        return
+    try:
+        seconds = int(seconds)
+    except:
+        await interaction.response.send_message("Giá trị seconds không hợp lệ.", ephemeral=True, delete_after=6)
+        return
+    if seconds < 1:
+        await interaction.response.send_message("Giá trị seconds phải lớn hơn 0.", ephemeral=True, delete_after=6)
+        return
+
+    # set global interval and persist (also changes running task interval)
+    set_global_scan_interval(seconds)
+
+    # reset next_check_time and restart countdown
+    global next_check_time
+    next_check_time = datetime.now(timezone.utc) + timedelta(seconds=CHECK_INTERVAL_SECONDS)
+
+    # update remaining messages immediately (best-effort)
+    for gid, ent in config.get("guilds", {}).items():
+        try:
+            await ensure_remaining_message_for_guild(int(gid))
+        except Exception:
+            pass
+
+    # run a scan immediately (like "start scanning again")
+    try:
+        for gid, ent in config.get("guilds", {}).items():
+            try:
+                gobj = bot.get_guild(int(gid)) or await bot.fetch_guild(int(gid))
+                # run each scan in background so /st doesn't hang long
+                asyncio.create_task(perform_scan_for_guild(gobj))
+            except Exception:
+                pass
+    except Exception as e:
+        print("Error running immediate scan after /st:", e)
+
+    await interaction.response.send_message(f"✅ Đã đặt thời gian quét: {CHECK_INTERVAL_SECONDS}s và đặt lại đếm ngược; quét ngay lập tức.", ephemeral=True, delete_after=6)
+
+
 # ---------------- Run ----------------
 if __name__ == "__main__":
     load_config()
@@ -1970,6 +2386,3 @@ if __name__ == "__main__":
         print("ERROR: BOT TOKEN chưa cấu hình. Set DISCORD_TOKEN environment variable.")
     else:
         bot.run(TOKEN)
-
-
-
